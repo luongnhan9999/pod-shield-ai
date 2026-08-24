@@ -1,7 +1,6 @@
 # v0.2.16
 # { "Depends": "py-genlayer:1jb45aa8ynh2a9c9xn3b7qqh8sm5q93hwfp7jqmwsfhh8jpz09h6" }
 from genlayer import *
-from genlayer.gl.vm import UserError
 from dataclasses import dataclass
 import json
 
@@ -141,12 +140,12 @@ class Contract(gl.Contract):
         self.deal_counter = bigint(0)
         treasury_addr = treasury_addr.strip() if treasury_addr else ""
         if not treasury_addr:
-            raise UserError("Treasury address is required")
+            raise gl.vm.UserError("Treasury address is required")
         try:
             # Validate address format during deployment
             Address(treasury_addr)
         except Exception:
-            raise UserError("Invalid treasury address format")
+            raise gl.vm.UserError("Invalid treasury address format")
         self.treasury_address = treasury_addr.lower()
         self.total_locked_budget = bigint(0)
         self.total_locked_bonds = bigint(0)
@@ -154,7 +153,7 @@ class Contract(gl.Contract):
 
     def _treasury(self) -> Address:
         if not self.treasury_address:
-            raise UserError("Treasury address is not configured")
+            raise gl.vm.UserError("Treasury address is not configured")
         return Address(self.treasury_address)
 
     def _is_http(self, url: str) -> bool:
@@ -171,26 +170,26 @@ class Contract(gl.Contract):
         """Brand creates a sponsorship deal and deposits payment into escrow."""
         budget = gl.message.value
         if budget <= bigint(0):
-            raise UserError("Campaign budget must be greater than 0")
+            raise gl.vm.UserError("Campaign budget must be greater than 0")
 
         creator_addr = creator_addr.strip()
         sponsor_script = sponsor_script.strip()
         required_promo_code = required_promo_code.strip()
 
         if not creator_addr:
-            raise UserError("Creator address is required")
+            raise gl.vm.UserError("Creator address is required")
         try:
             # Validate address format
             creator_addr_validated = Address(creator_addr)
         except Exception:
-            raise UserError("Invalid creator address format")
+            raise gl.vm.UserError("Invalid creator address format")
         
         creator_addr_normalized = creator_addr_validated.as_hex.lower()
 
         if len(sponsor_script) < 15:
-            raise UserError("Sponsor script/key talking points too short")
+            raise gl.vm.UserError("Sponsor script/key talking points too short")
         if len(required_promo_code) < 3:
-            raise UserError("Promo code too short")
+            raise gl.vm.UserError("Promo code too short")
 
         self.deal_counter += bigint(1)
         deal_id = str(self.deal_counter)
@@ -217,17 +216,17 @@ class Contract(gl.Contract):
     def accept_and_stake(self, deal_id: str) -> None:
         """Creator stakes a commitment bond to accept the ad placement deal."""
         if deal_id not in self.deals:
-            raise UserError("Deal not found")
+            raise gl.vm.UserError("Deal not found")
         deal = self.deals[deal_id]
 
         if _addr_str(gl.message.sender_address) != deal.creator.lower():
-            raise UserError("Only the designated creator can accept this deal")
+            raise gl.vm.UserError("Only the designated creator can accept this deal")
         if deal.status != "OPEN":
-            raise UserError("Deal is not open for acceptance")
+            raise gl.vm.UserError("Deal is not open for acceptance")
 
         bond = gl.message.value
         if bond <= bigint(0):
-            raise UserError("Commitment bond must be greater than 0")
+            raise gl.vm.UserError("Commitment bond must be greater than 0")
 
         deal.creator_bond = bond
         deal.status = "STAKED"
@@ -238,13 +237,13 @@ class Contract(gl.Contract):
     def cancel_deal(self, deal_id: str) -> None:
         """Brand can cancel and refund before creator stakes/accepts."""
         if deal_id not in self.deals:
-            raise UserError("Deal not found")
+            raise gl.vm.UserError("Deal not found")
         deal = self.deals[deal_id]
 
         if _addr_str(gl.message.sender_address) != deal.brand.lower():
-            raise UserError("Only the brand can cancel")
+            raise gl.vm.UserError("Only the brand can cancel")
         if deal.status != "OPEN":
-            raise UserError("Can only cancel deals in OPEN status")
+            raise gl.vm.UserError("Can only cancel deals in OPEN status")
 
         deal.status = "REFUNDED"
         deal.verdict = "ABORT"
@@ -268,19 +267,19 @@ class Contract(gl.Contract):
     ) -> None:
         """Creator submits public podcast/episode link, triggering autonomous AI consensus."""
         if deal_id not in self.deals:
-            raise UserError("Deal not found")
+            raise gl.vm.UserError("Deal not found")
         deal = self.deals[deal_id]
 
         if deal.status not in ("STAKED", "ESCALATED"):
-            raise UserError("Deal is not ready for adjudication")
+            raise gl.vm.UserError("Deal is not ready for adjudication")
 
         sender = _addr_str(gl.message.sender_address)
         if sender != deal.creator.lower() and sender != deal.brand.lower():
-            raise UserError("Only creator or brand can trigger adjudication")
+            raise gl.vm.UserError("Only creator or brand can trigger adjudication")
 
         episode_url = episode_url.strip()
         if not self._is_http(episode_url):
-            raise UserError("episode_url must start with http(s)://")
+            raise gl.vm.UserError("episode_url must start with http(s)://")
 
         deal.episode_url = episode_url
         deal.status = "AUDITING"
@@ -393,18 +392,18 @@ class Contract(gl.Contract):
     ) -> None:
         """Platform Arbiter manually resolves an ESCALATED deal."""
         if deal_id not in self.deals:
-            raise UserError("Deal not found")
+            raise gl.vm.UserError("Deal not found")
         deal = self.deals[deal_id]
 
         if deal.status != "ESCALATED":
-            raise UserError("Deal is not in ESCALATED status")
+            raise gl.vm.UserError("Deal is not in ESCALATED status")
 
         sender = _addr_str(gl.message.sender_address)
         if sender != self.platform_arbiter:
-            raise UserError("Only platform arbiter can resolve escalated deals")
+            raise gl.vm.UserError("Only platform arbiter can resolve escalated deals")
 
         if not (0 <= creator_percentage <= 100):
-            raise UserError("creator_percentage must be between 0 and 100")
+            raise gl.vm.UserError("creator_percentage must be between 0 and 100")
 
         budget_amt = deal.campaign_budget
         bond_amt = deal.creator_bond
@@ -442,7 +441,7 @@ class Contract(gl.Contract):
     @gl.public.view
     def get_deal(self, deal_id: str) -> str:
         if deal_id not in self.deals:
-            raise UserError("Deal not found")
+            raise gl.vm.UserError("Deal not found")
         d = self.deals[deal_id]
         return json.dumps({
             "id": d.id,
