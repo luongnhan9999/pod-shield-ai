@@ -30,10 +30,54 @@ def _parse_llm_json(text) -> dict:
         return {"verdict": "ABORT", "payout_pct": 0, "confidence": 0, "reason": f"Parse error: {str(e)}"}
 
 
+def _safe_parse(raw) -> dict:
+    data = _parse_llm_json(raw)
+    if not isinstance(data, dict):
+        return None
+
+    verdict = str(data.get("verdict", "")).strip().upper()
+    if verdict not in ("APPROVED", "PARTIAL", "REJECTED", "ABORT"):
+        return None
+
+    pct = data.get("payout_pct", 0)
+    if isinstance(pct, float):
+        pct = int(pct)
+    if not isinstance(pct, int) or not (0 <= pct <= 100):
+        return None
+
+    if verdict == "APPROVED":
+        pct = 100
+    elif verdict in ("REJECTED", "ABORT"):
+        pct = 0
+    elif verdict == "PARTIAL" and not (1 <= pct <= 99):
+        return None
+
+    conf = data.get("confidence", 0)
+    if isinstance(conf, float):
+        conf = int(conf)
+    if not isinstance(conf, int) or not (0 <= conf <= 100):
+        return None
+
+    reason = str(data.get("reason", ""))
+
+    # Bind confidence directly to verdict: Low confidence falls back to ABORT
+    if conf < 65 and verdict != "ABORT":
+        verdict = "ABORT"
+        pct = 0
+        reason = f"[low_confidence: {conf}%] " + reason
+
+    return {
+        "verdict": verdict,
+        "payout_pct": pct,
+        "confidence": conf,
+        "reason": reason[:300],
+    }
+
+
 def _evaluate(ep_url: str, script_target: str, promo_target: str) -> dict:
     try:
         res_ep = gl.nondet.web.render(ep_url, mode="text")
-        ep_text = str(res_ep)
+        ep_text = res_ep.content if hasattr(res_ep, "content") else str(res_ep)
         if not ep_text or len(ep_text.strip()) < 30:
             return {"verdict": "ABORT", "payout_pct": 0, "confidence": 0, "reason": "Episode page returned empty content"}
         if any(err in ep_text[:400].lower() for err in ["404 not found", "error 404", "page not found"]):
@@ -68,46 +112,23 @@ OUTPUT ONLY STRICT JSON:
   "reason": "max 300 chars technical explanation"
 }}
 """
-    raw1 = gl.nondet.exec_prompt(prompt, response_format="json")
-    raw2 = gl.nondet.exec_prompt(prompt, response_format="json")
+    try:
+        raw1 = gl.nondet.exec_prompt(prompt, response_format="json")
+        raw2 = gl.nondet.exec_prompt(prompt, response_format="json")
 
-    t1 = raw1.content if hasattr(raw1, "content") else raw1
-    t2 = raw2.content if hasattr(raw2, "content") else raw2
+        p1 = _safe_parse(raw1)
+        p2 = _safe_parse(raw2)
 
-    p1 = _parse_llm_json(t1)
-    p2 = _parse_llm_json(t2)
+        if p1 is None or p2 is None:
+            return {"verdict": "ABORT", "payout_pct": 0, "confidence": 0, "reason": "parse_failed"}
 
-    if p1.get("verdict") != p2.get("verdict"):
-        return {"verdict": "ABORT", "payout_pct": 0, "confidence": 0, "reason": "multi_sample_divergence"}
+        if (p1["verdict"] != p2["verdict"]) or (p1["payout_pct"] != p2["payout_pct"]):
+            return {"verdict": "ABORT", "payout_pct": 0, "confidence": 0, "reason": "multi_sample_divergence"}
 
-    verdict = str(p1.get("verdict", "ABORT")).upper()
-    if verdict not in ("APPROVED", "PARTIAL", "REJECTED", "ABORT"):
-        verdict = "ABORT"
-
-    pct = int(p1.get("payout_pct", 0))
-    if verdict == "APPROVED":
-        pct = 100
-    elif verdict in ("REJECTED", "ABORT"):
-        pct = 0
-    elif verdict == "PARTIAL" and not (1 <= pct <= 99):
-        verdict = "ABORT"
-        pct = 0
-
-    conf = (int(p1.get("confidence", 0)) + int(p2.get("confidence", 0))) // 2
-    reason = str(p1.get("reason", ""))
-
-    # Enforce strict confidence threshold
-    if conf < 65 and verdict != "ABORT":
-        verdict = "ABORT"
-        pct = 0
-        reason = f"[low_confidence: {conf}%] " + reason
-
-    return {
-        "verdict": verdict,
-        "payout_pct": pct,
-        "confidence": conf,
-        "reason": reason[:300],
-    }
+        p1["confidence"] = (p1["confidence"] + p2["confidence"]) // 2
+        return p1
+    except Exception as e:
+        return {"verdict": "ABORT", "payout_pct": 0, "confidence": 0, "reason": f"LLM error: {str(e)}"}
 
 
 @allow_storage
@@ -142,7 +163,6 @@ class Contract(gl.Contract):
         if not treasury_addr:
             raise gl.vm.UserError("Treasury address is required")
         try:
-            # Validate address format during deployment
             Address(treasury_addr)
         except Exception:
             raise gl.vm.UserError("Invalid treasury address format")
@@ -179,11 +199,10 @@ class Contract(gl.Contract):
         if not creator_addr:
             raise gl.vm.UserError("Creator address is required")
         try:
-            # Validate address format
             creator_addr_validated = Address(creator_addr)
         except Exception:
             raise gl.vm.UserError("Invalid creator address format")
-        
+
         creator_addr_normalized = creator_addr_validated.as_hex.lower()
 
         if len(sponsor_script) < 15:
@@ -257,7 +276,7 @@ class Contract(gl.Contract):
             self.total_locked_budget = bigint(0)
 
         if refund_amt > bigint(0):
-            gl.get_contract_at(Address(deal.brand)).emit_transfer(value=u256(refund_amt))
+            gl.get_contract_at(Address(deal.brand)).emit_transfer(value=refund_amt)
 
     @gl.public.write
     def submit_episode_and_adjudicate(
@@ -297,37 +316,36 @@ class Contract(gl.Contract):
                 return False
 
             leader_data = leader_res.calldata if hasattr(leader_res, "calldata") else leader_res
-            if not isinstance(leader_data, dict):
-                leader_data = _parse_llm_json(leader_data)
-
-            mine_data = _evaluate(ep_url, script_target, promo_target)
-
-            l_verdict = str(leader_data.get("verdict", "ABORT")).upper()
-            m_verdict = str(mine_data.get("verdict", "ABORT")).upper()
-            l_pct = int(leader_data.get("payout_pct", 0))
-            m_pct = int(mine_data.get("payout_pct", 0))
-            l_conf = int(leader_data.get("confidence", 0))
-            m_conf = int(mine_data.get("confidence", 0))
-
-            # Validate that they both agree on the confidence threshold
-            l_above = l_conf >= 65
-            m_above = m_conf >= 65
-            if l_above != m_above:
+            leader = _safe_parse(leader_data)
+            if leader is None:
                 return False
 
-            return (l_verdict == m_verdict) and (l_pct == m_pct)
+            mine = _safe_parse(_evaluate(ep_url, script_target, promo_target))
+            if mine is None:
+                return False
 
-        result = gl.vm.run_nondet(leader_fn, validator_fn)
-        if not isinstance(result, dict):
-            result = _parse_llm_json(result)
+            # Agree on verdict, payout_pct, and confidence threshold bucket
+            return (
+                mine["verdict"] == leader["verdict"]
+                and mine["payout_pct"] == leader["payout_pct"]
+                and (mine["confidence"] >= 65) == (leader["confidence"] >= 65)
+            )
 
-        verdict = str(result.get("verdict", "ABORT")).upper()
-        if verdict not in ("APPROVED", "PARTIAL", "REJECTED", "ABORT"):
+        result_raw = gl.vm.run_nondet(leader_fn, validator_fn)
+        result = _safe_parse(result_raw)
+
+        if result is None:
+            result = {"verdict": "ABORT", "payout_pct": 0, "confidence": 0, "reason": "adjudication_failed"}
+
+        verdict = result["verdict"]
+        payout_pct = result["payout_pct"]
+        confidence = result["confidence"]
+        reason = result["reason"]
+
+        # Post-consensus deterministic normalization: Ensure low-confidence is strictly bound to ABORT
+        if confidence < 65 and verdict != "ABORT":
             verdict = "ABORT"
-
-        payout_pct = int(result.get("payout_pct", 0))
-        confidence = int(result.get("confidence", 0))
-        reason = str(result.get("reason", "Media ad-placement consensus completed"))
+            payout_pct = 0
 
         deal.verdict = verdict
         deal.payout_pct = bigint(payout_pct)
@@ -348,12 +366,11 @@ class Contract(gl.Contract):
             creator_net = payout - fee
 
             if fee > bigint(0):
-                gl.get_contract_at(self._treasury()).emit_transfer(value=u256(fee))
-            # Creator receives earned budget share + 100% bond return
+                gl.get_contract_at(self._treasury()).emit_transfer(value=fee)
             if creator_net + bond_amt > bigint(0):
-                gl.get_contract_at(creator_addr).emit_transfer(value=u256(creator_net + bond_amt))
+                gl.get_contract_at(creator_addr).emit_transfer(value=creator_net + bond_amt)
             if refund_to_brand > bigint(0):
-                gl.get_contract_at(brand_addr).emit_transfer(value=u256(refund_to_brand))
+                gl.get_contract_at(brand_addr).emit_transfer(value=refund_to_brand)
 
             deal.status = "SETTLED"
             if self.total_locked_budget >= budget_amt:
@@ -368,7 +385,7 @@ class Contract(gl.Contract):
 
         elif verdict == "REJECTED":
             # Failed ad delivery: Brand gets 100% budget refund + slashed creator bond as damages
-            gl.get_contract_at(brand_addr).emit_transfer(value=u256(budget_amt + bond_amt))
+            gl.get_contract_at(brand_addr).emit_transfer(value=budget_amt + bond_amt)
             deal.status = "SETTLED"
 
             if self.total_locked_budget >= budget_amt:
@@ -420,11 +437,11 @@ class Contract(gl.Contract):
         creator_net = payout - fee
 
         if fee > bigint(0):
-            gl.get_contract_at(self._treasury()).emit_transfer(value=u256(fee))
+            gl.get_contract_at(self._treasury()).emit_transfer(value=fee)
         if creator_net + bond_amt > bigint(0):
-            gl.get_contract_at(creator_addr).emit_transfer(value=u256(creator_net + bond_amt))
+            gl.get_contract_at(creator_addr).emit_transfer(value=creator_net + bond_amt)
         if refund_to_brand > bigint(0):
-            gl.get_contract_at(brand_addr).emit_transfer(value=u256(refund_to_brand))
+            gl.get_contract_at(brand_addr).emit_transfer(value=refund_to_brand)
 
         deal.status = "SETTLED"
         deal.verdict = f"RESOLVED_MANUALLY_{creator_percentage}_PERCENT"
