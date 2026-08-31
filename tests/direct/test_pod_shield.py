@@ -261,3 +261,69 @@ def test_adjudicate_escalated_and_resolved(direct_vm, direct_deploy, direct_alic
     deal_info = json.loads(contract.get_deal(deal_id))
     assert deal_info["status"] == "SETTLED"
     assert deal_info["verdict"] == "RESOLVED_MANUALLY_40_PERCENT"
+
+
+def test_validator_confidence_threshold_mismatch(direct_vm, direct_deploy, direct_alice, direct_bob, direct_charlie):
+    # Deploy contract with Charlie as treasury
+    treasury = to_hex(direct_charlie)
+    contract = direct_deploy("contracts/pod_shield.py", treasury)
+    
+    # Create and stake
+    direct_vm.sender = direct_alice
+    direct_vm.value = 1000
+    deal_id = contract.create_deal(
+        to_hex(direct_bob),
+        "This is the sponsor script that is longer than fifteen characters",
+        "PROMO123"
+    )
+    direct_vm.value = 0
+    
+    direct_vm.sender = direct_bob
+    direct_vm.value = 500
+    contract.accept_and_stake(deal_id)
+    direct_vm.value = 0
+    
+    # 1. Leader runs and sees: verdict="APPROVED", payout_pct=100, confidence=70 (above 65)
+    episode_url = "https://example.com/episode_conf"
+    body_content = "This is a dummy transcript content that is longer than thirty characters for validation to pass successfully."
+    _setup_adjudicate_mocks(
+        direct_vm,
+        "example.com/episode_conf",
+        body_content,
+        "APPROVED",
+        100,
+        70
+    )
+    
+    direct_vm.sender = direct_bob
+    contract.submit_episode_and_adjudicate(deal_id, episode_url)
+    
+    # 2. Swap mocks so the validator runs and sees: verdict="APPROVED", payout_pct=100, confidence=50 (below 65)
+    # This simulates a validator node assessing low confidence.
+    direct_vm.clear_mocks()
+    _setup_adjudicate_mocks(
+        direct_vm,
+        "example.com/episode_conf",
+        body_content,
+        "APPROVED",
+        100,
+        50
+    )
+    
+    # Run the validator and check that it returns False (consensus fails due to threshold disagreement)
+    validation_passed = direct_vm.run_validator()
+    assert validation_passed is False
+    
+    # 3. Swap mocks so validator sees confidence=80 (also above 65).
+    # Consensus should pass.
+    direct_vm.clear_mocks()
+    _setup_adjudicate_mocks(
+        direct_vm,
+        "example.com/episode_conf",
+        body_content,
+        "APPROVED",
+        100,
+        80
+    )
+    validation_passed = direct_vm.run_validator()
+    assert validation_passed is True

@@ -306,6 +306,14 @@ class Contract(gl.Contract):
             m_verdict = str(mine_data.get("verdict", "ABORT")).upper()
             l_pct = int(leader_data.get("payout_pct", 0))
             m_pct = int(mine_data.get("payout_pct", 0))
+            l_conf = int(leader_data.get("confidence", 0))
+            m_conf = int(mine_data.get("confidence", 0))
+
+            # Validate that they both agree on the confidence threshold
+            l_above = l_conf >= 65
+            m_above = m_conf >= 65
+            if l_above != m_above:
+                return False
 
             return (l_verdict == m_verdict) and (l_pct == m_pct)
 
@@ -320,11 +328,6 @@ class Contract(gl.Contract):
         payout_pct = int(result.get("payout_pct", 0))
         confidence = int(result.get("confidence", 0))
         reason = str(result.get("reason", "Media ad-placement consensus completed"))
-
-        # Post-consensus deterministic normalization
-        if confidence < 65 and verdict != "ABORT":
-            verdict = "ABORT"
-            payout_pct = 0
 
         deal.verdict = verdict
         deal.payout_pct = bigint(payout_pct)
