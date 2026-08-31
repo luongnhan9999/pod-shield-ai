@@ -99,9 +99,9 @@ EPISODE PAGE CONTENT / TRANSCRIPT:
 {ep_text[:4000]}
 
 Rules:
-- APPROVED (payout_pct=100, conf >= 75): Ad-read covers all key talking points and includes the exact promo code/link.
-- PARTIAL (payout_pct=1-99, conf >= 75): Ad-read is present but missed minor points or slightly altered the script.
-- REJECTED (payout_pct=0, conf >= 75): No ad-read found, missing required promo code, or false delivery.
+- APPROVED (payout_pct=100, conf >= 65): Ad-read covers all key talking points and includes the exact promo code/link.
+- PARTIAL (payout_pct=1-99, conf >= 65): Ad-read is present but missed minor points or slightly altered the script.
+- REJECTED (payout_pct=0, conf >= 65): No ad-read found, missing required promo code, or false delivery.
 - ABORT: Content is rate-limited, captcha-blocked, audio player transcript inaccessible, or unreadable.
 
 OUTPUT ONLY STRICT JSON:
@@ -137,6 +137,7 @@ class SponsorshipDeal:
     id: str
     brand: str
     creator: str
+    creator_channel_base: str
     sponsor_script: str
     required_promo_code: str
     campaign_budget: bigint
@@ -184,6 +185,7 @@ class Contract(gl.Contract):
     def create_deal(
         self,
         creator_addr: str,
+        creator_channel_base: str,
         sponsor_script: str,
         required_promo_code: str,
     ) -> str:
@@ -193,6 +195,7 @@ class Contract(gl.Contract):
             raise gl.vm.UserError("Campaign budget must be greater than 0")
 
         creator_addr = creator_addr.strip()
+        creator_channel_base = creator_channel_base.strip()
         sponsor_script = sponsor_script.strip()
         required_promo_code = required_promo_code.strip()
 
@@ -204,6 +207,11 @@ class Contract(gl.Contract):
             raise gl.vm.UserError("Invalid creator address format")
 
         creator_addr_normalized = creator_addr_validated.as_hex.lower()
+
+        if not creator_channel_base:
+            raise gl.vm.UserError("Creator channel base URL is required")
+        if not self._is_http(creator_channel_base):
+            raise gl.vm.UserError("Creator channel base URL must start with http(s)://")
 
         if len(sponsor_script) < 15:
             raise gl.vm.UserError("Sponsor script/key talking points too short")
@@ -217,6 +225,7 @@ class Contract(gl.Contract):
             id=deal_id,
             brand=_addr_str(gl.message.sender_address),
             creator=creator_addr_normalized,
+            creator_channel_base=creator_channel_base,
             sponsor_script=sponsor_script,
             required_promo_code=required_promo_code,
             campaign_budget=budget,
@@ -299,6 +308,9 @@ class Contract(gl.Contract):
         episode_url = episode_url.strip()
         if not self._is_http(episode_url):
             raise gl.vm.UserError("episode_url must start with http(s)://")
+
+        if not episode_url.lower().startswith(deal.creator_channel_base.lower()):
+            raise gl.vm.UserError("Submitted episode URL must belong to the registered creator channel base")
 
         deal.episode_url = episode_url
         deal.status = "AUDITING"
@@ -467,6 +479,7 @@ class Contract(gl.Contract):
             "id": d.id,
             "brand": d.brand,
             "creator": d.creator,
+            "creator_channel_base": d.creator_channel_base,
             "sponsor_script": d.sponsor_script,
             "required_promo_code": d.required_promo_code,
             "campaign_budget": str(d.campaign_budget),

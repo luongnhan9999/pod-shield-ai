@@ -33,6 +33,7 @@ def test_create_deal(direct_vm, direct_deploy, direct_alice, direct_bob, direct_
     
     deal_id = contract.create_deal(
         to_hex(direct_bob),
+        "https://example.com/",
         "This is the sponsor script that is longer than fifteen characters",
         "PROMO123"
     )
@@ -48,6 +49,7 @@ def test_create_deal(direct_vm, direct_deploy, direct_alice, direct_bob, direct_
     assert deal_info["id"] == "1"
     assert deal_info["brand"] == to_hex(direct_alice).lower()
     assert deal_info["creator"] == to_hex(direct_bob).lower()
+    assert deal_info["creator_channel_base"] == "https://example.com/"
     assert deal_info["campaign_budget"] == "1000"
     assert deal_info["creator_bond"] == "0"
     assert deal_info["status"] == "OPEN"
@@ -61,6 +63,7 @@ def test_accept_and_stake(direct_vm, direct_deploy, direct_alice, direct_bob, di
     direct_vm.value = 1000
     deal_id = contract.create_deal(
         to_hex(direct_bob),
+        "https://example.com/",
         "This is the sponsor script that is longer than fifteen characters",
         "PROMO123"
     )
@@ -84,6 +87,7 @@ def test_cancel_deal(direct_vm, direct_deploy, direct_alice, direct_bob, direct_
     direct_vm.value = 1000
     deal_id = contract.create_deal(
         to_hex(direct_bob),
+        "https://example.com/",
         "This is the sponsor script that is longer than fifteen characters",
         "PROMO123"
     )
@@ -106,6 +110,7 @@ def test_adjudicate_approved(direct_vm, direct_deploy, direct_alice, direct_bob,
     direct_vm.value = 1000
     deal_id = contract.create_deal(
         to_hex(direct_bob),
+        "https://example.com/",
         "This is the sponsor script that is longer than fifteen characters",
         "PROMO123"
     )
@@ -146,6 +151,7 @@ def test_adjudicate_partial(direct_vm, direct_deploy, direct_alice, direct_bob, 
     direct_vm.value = 1000
     deal_id = contract.create_deal(
         to_hex(direct_bob),
+        "https://example.com/",
         "This is the sponsor script that is longer than fifteen characters",
         "PROMO123"
     )
@@ -185,6 +191,7 @@ def test_adjudicate_rejected(direct_vm, direct_deploy, direct_alice, direct_bob,
     direct_vm.value = 1000
     deal_id = contract.create_deal(
         to_hex(direct_bob),
+        "https://example.com/",
         "This is the sponsor script that is longer than fifteen characters",
         "PROMO123"
     )
@@ -226,6 +233,7 @@ def test_adjudicate_escalated_and_resolved(direct_vm, direct_deploy, direct_alic
     direct_vm.value = 1000
     deal_id = contract.create_deal(
         to_hex(direct_bob),
+        "https://example.com/",
         "This is the sponsor script that is longer than fifteen characters",
         "PROMO123"
     )
@@ -273,6 +281,7 @@ def test_validator_confidence_threshold_mismatch(direct_vm, direct_deploy, direc
     direct_vm.value = 1000
     deal_id = contract.create_deal(
         to_hex(direct_bob),
+        "https://example.com/",
         "This is the sponsor script that is longer than fifteen characters",
         "PROMO123"
     )
@@ -327,3 +336,32 @@ def test_validator_confidence_threshold_mismatch(direct_vm, direct_deploy, direc
     )
     validation_passed = direct_vm.run_validator()
     assert validation_passed is True
+
+
+def test_adjudicate_invalid_url_prefix(direct_vm, direct_deploy, direct_alice, direct_bob, direct_charlie):
+    contract = direct_deploy("contracts/pod_shield.py", to_hex(direct_charlie))
+    
+    # Alice creates a deal with channel base URL: https://example.com/
+    direct_vm.sender = direct_alice
+    direct_vm.value = 1000
+    deal_id = contract.create_deal(
+        to_hex(direct_bob),
+        "https://example.com/",
+        "This is the sponsor script that is longer than fifteen characters",
+        "PROMO123"
+    )
+    direct_vm.value = 0
+    
+    # Bob (creator) accepts and stakes
+    direct_vm.sender = direct_bob
+    direct_vm.value = 500
+    contract.accept_and_stake(deal_id)
+    direct_vm.value = 0
+    
+    # Try to submit episode URL that does not match prefix (e.g. hacky-site.com)
+    episode_url = "https://hacky-site.com/episode1"
+    
+    # Should revert with UserError because of prefix mismatch
+    with direct_vm.expect_revert("Submitted episode URL must belong to the registered creator channel base"):
+        direct_vm.sender = direct_bob
+        contract.submit_episode_and_adjudicate(deal_id, episode_url)
