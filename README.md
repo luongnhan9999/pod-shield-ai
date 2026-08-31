@@ -9,7 +9,7 @@ Brands lock their sponsorship budgets in escrow, and creators stake a commitment
 ## 🚀 Deployment Info
 
 *   **Network**: `studionet` (GenLayer Studio Network)
-*   **Contract Address**: `0xe18d71D7275E8dB079120035AEe0c4B63fA37CaC`
+*   **Contract Address**: `0x9Af8f98B2a343e689345630a4882f17d9bb5a86b`
 
 ---
 
