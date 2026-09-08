@@ -27,21 +27,27 @@ Rather than relying on brittle keyword matching or exact string checks (which fa
 
 ### Write Methods
 
-*   **`create_deal(creator_addr: str, sponsor_script: str, required_promo_code: str) -> str`** *(Payable)*
-    Allows a brand to create a deal by specifying the creator's address, the required sponsor talking points/script, and the mandatory promo code/link. The brand sends the sponsorship budget as the transaction value. Returns a unique `deal_id`.
+*   **`create_deal(creator_addr: str, creator_channel_base: str, sponsor_script: str, required_promo_code: str) -> str`** *(Payable)*
+    Allows a brand to create a deal by specifying the creator's address, the official channel base URL prefix (e.g., `https://my-podcast-host.com/`), the required sponsor talking points/script, and the mandatory promo code/link. The brand sends the sponsorship budget as the transaction value. Returns a unique `deal_id`.
 *   **`accept_and_stake(deal_id: str)`** *(Payable)*
-    Allows the designated creator to accept the deal by staking a commitment bond (sent as transaction value).
+    Allows the designated creator to accept the deal by staking a commitment bond (sent as transaction value). Status transitions to `STAKED`.
 *   **`cancel_deal(deal_id: str)`**
     Allows the brand to cancel the deal and receive a 100% refund of their budget, but only *before* the creator accepts and stakes.
-*   **`submit_episode_and_adjudicate(deal_id: str, episode_url: str)`**
-    Triggered by either the brand or creator. Submits the public episode URL, fetches the transcript, triggers the AI consensus audit, and settles the funds automatically based on the verdict.
+*   **`commit_episode(deal_id: str, episode_url: str)`**
+    **Exclusively called by the designated creator**. Commits the exact public episode URL delivery evidence. The contract validates that `episode_url` starts with `creator_channel_base`. Status transitions to `COMMITTED`. Does not move funds.
+*   **`approve_delivery(deal_id: str)`**
+    **Called by the brand**. Directly reviews and approves the creator's committed episode, immediately disbursing payout and refunding the creator's bond without requiring AI consensus fees.
+*   **`challenge_delivery(deal_id: str)`**
+    **Called by the brand**. Challenges the committed episode delivery, triggering GenLayer's autonomous AI consensus on the pre-committed URL.
+*   **`adjudicate_deal(deal_id: str)`**
+    Called by either creator or brand. Triggers autonomous AI consensus to audit the pre-committed episode evidence (`deal.episode_url`), enforcing consensus on the semantic verdict, payout percentage, and confidence threshold (`>= 65%`).
 *   **`resolve_escalated_deal(deal_id: str, creator_percentage: int)`**
-    Allows the platform arbiter to manually resolve a deal that has been escalated (`ESCALATED`) due to low LLM confidence or validator disagreement.
+    Allows the platform arbiter to manually resolve a deal that has been escalated (`ESCALATED`) due to low LLM confidence or validator divergence.
 
 ### View Methods
 
 *   **`get_deal(deal_id: str) -> str`**
-    Returns a JSON string containing the detailed state of a deal.
+    Returns a JSON string containing the detailed state of a deal, including `creator_channel_base`, `episode_url`, `status`, `verdict`, and `confidence`.
 *   **`get_deal_counter() -> int`**
     Returns the total number of deals created.
 *   **`get_treasury() -> str`**
@@ -57,21 +63,26 @@ Here is a step-by-step example of how a sponsorship deal is executed and settled
 *   **Action**: Brand invokes `create_deal` with `1 GEN` budget.
 *   **Inputs**:
     *   `creator_addr`: `"0x2bd806c97F0e00aF1a1fC3328fA763a9269723C8"`
+    *   `creator_channel_base`: `"https://my-podcast-host.com/"`
     *   `sponsor_script`: `"Support for this podcast comes from PodShield. Get 20% off your first subscription using code POD20 today."`
     *   `required_promo_code`: `"POD20"`
-*   **Output**: `deal_id = "1"`
+*   **Output**: `deal_id = "1"` (Status: `OPEN`)
 
 ### 2. Deal Acceptance (Creator)
 *   **Action**: Creator invokes `accept_and_stake("1")` and stakes `0.5 GEN` as a commitment bond.
 *   **State transition**: Deal status changes from `OPEN` to `STAKED`.
 
-### 3. Submission & Adjudication (Creator)
-*   **Action**: Creator publishes the episode and invokes `submit_episode_and_adjudicate("1", "https://my-podcast-host.com/episodes/42")`.
-*   **Execution**:
-    *   The contract fetches the page content from `https://my-podcast-host.com/episodes/42` containing the transcript:
-        `"...Thank you to our sponsor PodShield! Support for this podcast comes from PodShield. Get 20% off your first subscription using code POD20 today. Now back to the show..."`
-    *   GenLayer AI consensus validates the ad-read. Both nodes agree on the verdict.
-*   **Real Consensus Verdict (Audit Output)**:
+### 3. Exact Episode Commitment (Creator Only)
+*   **Action**: Creator publishes the episode and invokes `commit_episode("1", "https://my-podcast-host.com/episodes/42")`.
+*   **Validation**: The contract confirms `episode_url` begins with `https://my-podcast-host.com/` and caller is the creator.
+*   **State transition**: Deal status changes to `COMMITTED`. The URL is permanently bound to the deal.
+
+### 4. Review & Adjudication / Challenge
+*   **Direct Path**: Brand can review and call `approve_delivery("1")` for immediate settlement.
+*   **Autonomous AI Audit Path**: Brand challenges or Creator triggers `adjudicate_deal("1")`.
+    *   The contract fetches `https://my-podcast-host.com/episodes/42` transcript.
+    *   GenLayer AI consensus audits the ad-read. Independent validator nodes agree on the verdict and confidence threshold (`>= 65%`).
+*   **Consensus Verdict**:
     ```json
     {
       "verdict": "APPROVED",
@@ -83,7 +94,7 @@ Here is a step-by-step example of how a sponsorship deal is executed and settled
 *   **Escrow Settlement (Deterministic)**:
     *   Creator Net Payout: `0.98 GEN` (100% budget minus 2% protocol fee).
     *   Treasury Fee: `0.02 GEN` (2% protocol fee).
-    *   Bond Returned: `0.5 GEN` returned in full to the creator.
+    *   Bond Returned: `0.5 GEN` returned in full to creator.
     *   **Total Creator Received**: `1.48 GEN`
     *   **Total Treasury Received**: `0.02 GEN`
     *   **Deal Status**: `SETTLED`

@@ -143,7 +143,7 @@ class SponsorshipDeal:
     campaign_budget: bigint
     creator_bond: bigint
     episode_url: str
-    status: str       # OPEN | STAKED | AUDITING | SETTLED | REFUNDED | ESCALATED
+    status: str       # OPEN | STAKED | COMMITTED | AUDITING | SETTLED | REFUNDED | ESCALATED
     verdict: str      # APPROVED | PARTIAL | REJECTED | ABORT
     payout_pct: bigint
     confidence: bigint
@@ -288,22 +288,21 @@ class Contract(gl.Contract):
             gl.get_contract_at(Address(deal.brand)).emit_transfer(value=refund_amt)
 
     @gl.public.write
-    def submit_episode_and_adjudicate(
+    def commit_episode(
         self,
         deal_id: str,
         episode_url: str,
     ) -> None:
-        """Creator submits public podcast/episode link, triggering autonomous AI consensus."""
+        """Creator exclusively commits the exact public episode URL evidence for the deal."""
         if deal_id not in self.deals:
             raise gl.vm.UserError("Deal not found")
         deal = self.deals[deal_id]
 
-        if deal.status not in ("STAKED", "ESCALATED"):
-            raise gl.vm.UserError("Deal is not ready for adjudication")
+        if _addr_str(gl.message.sender_address) != deal.creator.lower():
+            raise gl.vm.UserError("Only the designated creator can commit the episode URL")
 
-        sender = _addr_str(gl.message.sender_address)
-        if sender != deal.creator.lower() and sender != deal.brand.lower():
-            raise gl.vm.UserError("Only creator or brand can trigger adjudication")
+        if deal.status not in ("STAKED", "COMMITTED"):
+            raise gl.vm.UserError("Deal must be in STAKED or COMMITTED status to commit episode URL")
 
         episode_url = episode_url.strip()
         if not self._is_http(episode_url):
@@ -313,12 +312,86 @@ class Contract(gl.Contract):
             raise gl.vm.UserError("Submitted episode URL must belong to the registered creator channel base")
 
         deal.episode_url = episode_url
+        deal.status = "COMMITTED"
+        self.deals[deal_id] = deal
+
+    @gl.public.write
+    def approve_delivery(self, deal_id: str) -> None:
+        """Brand directly reviews and approves the committed episode, releasing escrow without AI audit."""
+        if deal_id not in self.deals:
+            raise gl.vm.UserError("Deal not found")
+        deal = self.deals[deal_id]
+
+        if _addr_str(gl.message.sender_address) != deal.brand.lower():
+            raise gl.vm.UserError("Only the brand can directly approve delivery")
+
+        if deal.status != "COMMITTED":
+            raise gl.vm.UserError("Deal must be in COMMITTED status to approve delivery")
+
+        budget_amt = deal.campaign_budget
+        bond_amt = deal.creator_bond
+        creator_addr = Address(deal.creator)
+
+        # 2% protocol fee on creator payout
+        fee = (budget_amt * bigint(2)) // bigint(100)
+        creator_net = budget_amt - fee
+
+        if fee > bigint(0):
+            gl.get_contract_at(self._treasury()).emit_transfer(value=fee)
+        if creator_net + bond_amt > bigint(0):
+            gl.get_contract_at(creator_addr).emit_transfer(value=creator_net + bond_amt)
+
+        deal.status = "SETTLED"
+        deal.verdict = "APPROVED_BY_BRAND"
+        deal.payout_pct = bigint(100)
+        deal.reason = "Directly approved by brand"
+        self.deals[deal_id] = deal
+
+        if self.total_locked_budget >= budget_amt:
+            self.total_locked_budget -= budget_amt
+        else:
+            self.total_locked_budget = bigint(0)
+
+        if self.total_locked_bonds >= bond_amt:
+            self.total_locked_bonds -= bond_amt
+        else:
+            self.total_locked_bonds = bigint(0)
+
+    @gl.public.write
+    def challenge_delivery(self, deal_id: str) -> None:
+        """Brand challenges the committed episode delivery, triggering autonomous AI consensus."""
+        if deal_id not in self.deals:
+            raise gl.vm.UserError("Deal not found")
+        deal = self.deals[deal_id]
+
+        if _addr_str(gl.message.sender_address) != deal.brand.lower():
+            raise gl.vm.UserError("Only the brand can challenge delivery")
+
+        self.adjudicate_deal(deal_id)
+
+    @gl.public.write
+    def adjudicate_deal(self, deal_id: str) -> None:
+        """Autonomous AI consensus audits the pre-committed episode evidence without on-the-fly URL tampering."""
+        if deal_id not in self.deals:
+            raise gl.vm.UserError("Deal not found")
+        deal = self.deals[deal_id]
+
+        if deal.status not in ("COMMITTED", "ESCALATED"):
+            raise gl.vm.UserError("Deal is not ready for adjudication (creator must commit episode first)")
+
+        sender = _addr_str(gl.message.sender_address)
+        if sender != deal.creator.lower() and sender != deal.brand.lower():
+            raise gl.vm.UserError("Only creator or brand can trigger adjudication")
+
+        if not deal.episode_url:
+            raise gl.vm.UserError("No episode URL has been committed for this deal")
+
         deal.status = "AUDITING"
         self.deals[deal_id] = deal
 
         script_target = str(deal.sponsor_script)
         promo_target = str(deal.required_promo_code)
-        ep_url = str(episode_url)
+        ep_url = str(deal.episode_url)
 
         def leader_fn():
             return _evaluate(ep_url, script_target, promo_target)
