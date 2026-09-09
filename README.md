@@ -80,15 +80,18 @@ Here is a step-by-step example of how a sponsorship deal is executed and settled
 ### 4. Review & Adjudication / Challenge
 *   **Direct Path**: Brand can review and call `approve_delivery("1")` for immediate settlement.
 *   **Autonomous AI Audit Path**: Brand challenges or Creator triggers `adjudicate_deal("1")`.
-    *   The contract fetches `https://my-podcast-host.com/episodes/42` transcript.
-    *   GenLayer AI consensus audits the ad-read. Independent validator nodes agree on the verdict and confidence threshold (`>= 65%`).
+    *   **Content-Hash Grounding**: Leader fetches the committed episode page and calculates a deterministic SHA-256 fingerprint of the normalized content.
+    *   **Consensus Binding**: Validator independently fetches the page and validates that its own content fingerprint exactly matches the leader's. If the page content differs or was modified, consensus fails immediately.
+    *   **Fail-Closed Architecture**: If content is too short (< 200 chars), blocked by captcha/404/rate-limit, or if LLM produces malformed output, the contract safely escalates to `ESCALATED` status without moving any escrow funds.
+    *   GenLayer AI consensus audits the ad-read. Independent validator nodes agree on the verdict, payout percentage, confidence threshold (`>= 65%`), and content hash.
 *   **Consensus Verdict**:
     ```json
     {
       "verdict": "APPROVED",
       "payout_pct": 100,
       "confidence": 95,
-      "reason": "The creator successfully read the full script and included the required promo code POD20."
+      "reason": "The creator successfully read the full script and included the required promo code POD20.",
+      "content_hash": "a1b2c3...64-char SHA256"
     }
     ```
 *   **Escrow Settlement (Deterministic)**:

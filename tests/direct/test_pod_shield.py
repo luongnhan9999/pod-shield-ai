@@ -1,5 +1,13 @@
 import json
+import hashlib
 from tests.direct.conftest import to_hex
+
+
+def _compute_content_hash(text: str) -> str:
+    """Mirror the contract's _content_hash for test setup."""
+    normalized = " ".join(text.split())
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
 
 def _setup_adjudicate_mocks(vm, episode_url, body_content, llm_verdict, payout_pct, confidence, reason="Consensus audit completed"):
     """Register web rendering and LLM mocks for adjudication."""
@@ -7,6 +15,9 @@ def _setup_adjudicate_mocks(vm, episode_url, body_content, llm_verdict, payout_p
         rf".*{episode_url}.*",
         {"status": 200, "body": body_content},
     )
+    
+    # Compute content hash matching the contract's deterministic hash
+    ch = _compute_content_hash(body_content)
     
     # The prompt regex matches the system prompt for Media & Podcast Sponsorship Auditor
     prompt_pattern = r".*SYSTEM: You are a strict Media & Podcast Sponsorship Auditor.*"
@@ -124,7 +135,7 @@ def test_adjudicate_approved(direct_vm, direct_deploy, direct_alice, direct_bob,
     
     # 3. Adjudicate (mocking LLM as APPROVED)
     episode_url = "https://example.com/episode1"
-    body_content = "This transcript contains sponsor script that is longer than fifteen characters and the promo code PROMO123"
+    body_content = "Welcome to the podcast episode one. Today we discuss technology and innovation in the digital age. Our sponsor for this episode has a great message. This is the sponsor script that is longer than fifteen characters and they want you to use the promo code PROMO123 for a discount."
     _setup_adjudicate_mocks(
         direct_vm,
         "example.com/episode1",
@@ -165,7 +176,7 @@ def test_adjudicate_partial(direct_vm, direct_deploy, direct_alice, direct_bob, 
     
     # Adjudicate (mocking LLM as PARTIAL payout 75%)
     episode_url = "https://example.com/episode2"
-    body_content = "This is a transcript where the creator mentions most of the sponsor script but changes a small part, uses promo PROMO123"
+    body_content = "Welcome to podcast episode two. In this episode we cover various topics about health and wellness in modern life. The creator mentions most of the sponsor script but changes a small part of the talking points and slightly alters the wording. They do use the promo code PROMO123 correctly."
     _setup_adjudicate_mocks(
         direct_vm,
         "example.com/episode2",
@@ -206,7 +217,7 @@ def test_adjudicate_rejected(direct_vm, direct_deploy, direct_alice, direct_bob,
     
     # Adjudicate (mocking LLM as REJECTED)
     episode_url = "https://example.com/episode3"
-    body_content = "This transcript does not mention anything related to the sponsor and does not contain the promo code."
+    body_content = "Welcome to podcast episode three. In today's episode we explore the fascinating world of astronomy and space exploration. This transcript does not mention anything related to the sponsor brand and does not contain the promo code at all. The host talks about unrelated topics throughout the entire episode."
     _setup_adjudicate_mocks(
         direct_vm,
         "example.com/episode3",
@@ -249,7 +260,7 @@ def test_adjudicate_escalated_and_resolved(direct_vm, direct_deploy, direct_alic
     
     # Adjudicate (mocking LLM as ABORT due to failure/divergence)
     episode_url = "https://example.com/episode4"
-    body_content = "Some page content"
+    body_content = "Welcome to podcast episode four. Today we have an in-depth conversation about decentralization and smart contracts. However, the external episode page encounters an error or network abort condition during consensus auditing evaluation."
     _setup_adjudicate_mocks(
         direct_vm,
         "example.com/episode4",
@@ -298,7 +309,7 @@ def test_validator_confidence_threshold_mismatch(direct_vm, direct_deploy, direc
     
     # 1. Leader runs and sees: verdict="APPROVED", payout_pct=100, confidence=70 (above 65)
     episode_url = "https://example.com/episode_conf"
-    body_content = "This is a dummy transcript content that is longer than thirty characters for validation to pass successfully."
+    body_content = "This is a comprehensive transcript content that is significantly longer than two hundred characters so that all validation and content-hash grounding checks in the smart contract will pass successfully without any aborts."
     _setup_adjudicate_mocks(
         direct_vm,
         "example.com/episode_conf",
@@ -454,7 +465,7 @@ def test_challenge_delivery_by_brand(direct_vm, direct_deploy, direct_alice, dir
     contract.commit_episode(deal_id, "https://example.com/episode1")
     
     # Setup mocks for AI audit
-    body_content = "This transcript contains sponsor script that is longer than fifteen characters and the promo code PROMO123"
+    body_content = "Welcome to podcast episode one challenged by the brand. Today we discuss technology and innovation in the digital age. Our sponsor for this episode has a great message. This is the sponsor script that is longer than fifteen characters and they want you to use the promo code PROMO123 for a discount."
     _setup_adjudicate_mocks(
         direct_vm,
         "example.com/episode1",
@@ -496,3 +507,131 @@ def test_adjudicate_uncommitted_deal(direct_vm, direct_deploy, direct_alice, dir
     with direct_vm.expect_revert("Deal is not ready for adjudication (creator must commit episode first)"):
         direct_vm.sender = direct_bob
         contract.adjudicate_deal(deal_id)
+
+
+def test_validator_content_hash_mismatch_fails_consensus(direct_vm, direct_deploy, direct_alice, direct_bob, direct_charlie):
+    contract = direct_deploy("contracts/pod_shield.py", to_hex(direct_charlie))
+    
+    direct_vm.sender = direct_alice
+    direct_vm.value = 1000
+    deal_id = contract.create_deal(
+        to_hex(direct_bob),
+        "https://example.com/",
+        "This is the sponsor script that is longer than fifteen characters",
+        "PROMO123"
+    )
+    direct_vm.value = 0
+    
+    direct_vm.sender = direct_bob
+    direct_vm.value = 500
+    contract.accept_and_stake(deal_id)
+    direct_vm.value = 0
+    
+    episode_url = "https://example.com/episode_hash_diff"
+    content_leader = "Welcome to episode version A with creator talking about our wonderful sponsor script that is longer than fifteen characters and the promo code PROMO123. This text easily exceeds two hundred characters for valid content length verification."
+    content_validator = "Welcome to episode version B with completely modified creator talking points and different text that also exceeds two hundred characters, but produces a completely different content hash than version A seen by leader."
+    
+    # 1. Leader runs with content_leader
+    _setup_adjudicate_mocks(
+        direct_vm,
+        "example.com/episode_hash_diff",
+        content_leader,
+        "APPROVED",
+        100,
+        90
+    )
+    direct_vm.sender = direct_bob
+    contract.commit_episode(deal_id, episode_url)
+    contract.adjudicate_deal(deal_id)
+    
+    # 2. Validator fetches page but receives content_validator (different content hash)
+    direct_vm.clear_mocks()
+    _setup_adjudicate_mocks(
+        direct_vm,
+        "example.com/episode_hash_diff",
+        content_validator,
+        "APPROVED",
+        100,
+        90
+    )
+    
+    # Consensus MUST fail because content hashes do not match (grounding check)
+    validation_passed = direct_vm.run_validator()
+    assert validation_passed is False
+
+
+def test_adjudicate_empty_page_fails_closed(direct_vm, direct_deploy, direct_alice, direct_bob, direct_charlie):
+    contract = direct_deploy("contracts/pod_shield.py", to_hex(direct_charlie))
+    
+    direct_vm.sender = direct_alice
+    direct_vm.value = 1000
+    deal_id = contract.create_deal(
+        to_hex(direct_bob),
+        "https://example.com/",
+        "This is the sponsor script that is longer than fifteen characters",
+        "PROMO123"
+    )
+    direct_vm.value = 0
+    
+    direct_vm.sender = direct_bob
+    direct_vm.value = 500
+    contract.accept_and_stake(deal_id)
+    direct_vm.value = 0
+    
+    episode_url = "https://example.com/episode_empty"
+    # Page returns too short/empty content (< 200 chars)
+    direct_vm.mock_web(
+        rf".*{episode_url}.*",
+        {"status": 200, "body": "Short page text"},
+    )
+    
+    direct_vm.sender = direct_bob
+    contract.commit_episode(deal_id, episode_url)
+    contract.adjudicate_deal(deal_id)
+    
+    # Must fail closed to ESCALATED, escrow untouched
+    deal_info = json.loads(contract.get_deal(deal_id))
+    assert deal_info["status"] == "ESCALATED"
+    assert deal_info["verdict"] == "ABORT"
+
+
+def test_adjudicate_malformed_llm_fails_closed(direct_vm, direct_deploy, direct_alice, direct_bob, direct_charlie):
+    contract = direct_deploy("contracts/pod_shield.py", to_hex(direct_charlie))
+    
+    direct_vm.sender = direct_alice
+    direct_vm.value = 1000
+    deal_id = contract.create_deal(
+        to_hex(direct_bob),
+        "https://example.com/",
+        "This is the sponsor script that is longer than fifteen characters",
+        "PROMO123"
+    )
+    direct_vm.value = 0
+    
+    direct_vm.sender = direct_bob
+    direct_vm.value = 500
+    contract.accept_and_stake(deal_id)
+    direct_vm.value = 0
+    
+    episode_url = "https://example.com/episode_malformed"
+    body_content = "This is a legitimate episode page transcript that exceeds two hundred characters in length to pass initial web fetch content validation before reaching LLM execution phase."
+    
+    direct_vm.mock_web(
+        rf".*{episode_url}.*",
+        {"status": 200, "body": body_content},
+    )
+    # Mock LLM returning malformed gibberish output
+    direct_vm.mock_llm(
+        r".*SYSTEM: You are a strict Media \& Podcast Sponsorship Auditor.*",
+        "This is not JSON at all and completely malformed output from model"
+    )
+    
+    direct_vm.sender = direct_bob
+    contract.commit_episode(deal_id, episode_url)
+    contract.adjudicate_deal(deal_id)
+    
+    # Must fail closed: deal escalated, funds protected
+    deal_info = json.loads(contract.get_deal(deal_id))
+    assert deal_info["status"] == "ESCALATED"
+    assert deal_info["verdict"] == "ABORT"
+

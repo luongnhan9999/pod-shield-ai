@@ -3,6 +3,7 @@
 from genlayer import *
 from dataclasses import dataclass
 import json
+import hashlib
 
 
 def _addr_str(addr: Address) -> str:
@@ -10,6 +11,12 @@ def _addr_str(addr: Address) -> str:
         return addr.as_hex.lower()
     except Exception:
         return str(addr).lower()
+
+
+def _content_hash(text: str) -> str:
+    """Compute SHA-256 hex digest of normalized page content for consensus binding."""
+    normalized = " ".join(text.split())
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 
 
 def _parse_llm_json(text) -> dict:
@@ -60,6 +67,15 @@ def _safe_parse(raw) -> dict:
 
     reason = str(data.get("reason", ""))
 
+    # Require content_hash for grounding: fail closed if missing or malformed
+    ch = data.get("content_hash", "")
+    if not isinstance(ch, str) or len(ch) != 64:
+        return None
+    try:
+        int(ch, 16)  # validate hex
+    except ValueError:
+        return None
+
     # Bind confidence directly to verdict: Low confidence falls back to ABORT
     if conf < 65 and verdict != "ABORT":
         verdict = "ABORT"
@@ -71,19 +87,31 @@ def _safe_parse(raw) -> dict:
         "payout_pct": pct,
         "confidence": conf,
         "reason": reason[:300],
+        "content_hash": ch,
     }
 
 
 def _evaluate(ep_url: str, script_target: str, promo_target: str) -> dict:
+    _ABORT = lambda reason: {"verdict": "ABORT", "payout_pct": 0, "confidence": 0, "reason": reason, "content_hash": "0" * 64}
+
     try:
         res_ep = gl.nondet.web.render(ep_url, mode="text")
         ep_text = res_ep.content if hasattr(res_ep, "content") else str(res_ep)
-        if not ep_text or len(ep_text.strip()) < 30:
-            return {"verdict": "ABORT", "payout_pct": 0, "confidence": 0, "reason": "Episode page returned empty content"}
-        if any(err in ep_text[:400].lower() for err in ["404 not found", "error 404", "page not found"]):
-            return {"verdict": "ABORT", "payout_pct": 0, "confidence": 0, "reason": "Episode page returned 404"}
     except Exception as e:
-        return {"verdict": "ABORT", "payout_pct": 0, "confidence": 0, "reason": f"Web fetch failed: {str(e)}"}
+        return _ABORT(f"Web fetch failed: {str(e)}")
+
+    if not ep_text or len(ep_text.strip()) < 200:
+        return _ABORT("Episode page content too short or empty (min 200 chars)")
+
+    low = ep_text[:500].lower()
+    blockers = ["404 not found", "error 404", "page not found", "access denied",
+                "captcha", "rate limit", "too many requests", "403 forbidden"]
+    for b in blockers:
+        if b in low:
+            return _ABORT(f"Episode page blocked: {b}")
+
+    # Compute deterministic content hash for consensus binding
+    ch = _content_hash(ep_text)
 
     prompt = f"""
 SYSTEM: You are a strict Media & Podcast Sponsorship Auditor.
@@ -116,19 +144,27 @@ OUTPUT ONLY STRICT JSON:
         raw1 = gl.nondet.exec_prompt(prompt, response_format="json")
         raw2 = gl.nondet.exec_prompt(prompt, response_format="json")
 
-        p1 = _safe_parse(raw1)
-        p2 = _safe_parse(raw2)
+        # Inject the content_hash into parsed LLM output before validation
+        p1_raw = _parse_llm_json(raw1)
+        p2_raw = _parse_llm_json(raw2)
+        if isinstance(p1_raw, dict):
+            p1_raw["content_hash"] = ch
+        if isinstance(p2_raw, dict):
+            p2_raw["content_hash"] = ch
+
+        p1 = _safe_parse(p1_raw)
+        p2 = _safe_parse(p2_raw)
 
         if p1 is None or p2 is None:
-            return {"verdict": "ABORT", "payout_pct": 0, "confidence": 0, "reason": "parse_failed"}
+            return _ABORT("parse_failed")
 
         if (p1["verdict"] != p2["verdict"]) or (p1["payout_pct"] != p2["payout_pct"]):
-            return {"verdict": "ABORT", "payout_pct": 0, "confidence": 0, "reason": "multi_sample_divergence"}
+            return _ABORT("multi_sample_divergence")
 
         p1["confidence"] = (p1["confidence"] + p2["confidence"]) // 2
         return p1
     except Exception as e:
-        return {"verdict": "ABORT", "payout_pct": 0, "confidence": 0, "reason": f"LLM error: {str(e)}"}
+        return _ABORT(f"LLM error: {str(e)}")
 
 
 @allow_storage
@@ -409,6 +445,10 @@ class Contract(gl.Contract):
             if mine is None:
                 return False
 
+            # Content-hash binding: reject consensus if nodes fetched different page content
+            if mine["content_hash"] != leader["content_hash"]:
+                return False
+
             # Agree on verdict, payout_pct, and confidence threshold bucket
             return (
                 mine["verdict"] == leader["verdict"]
@@ -419,8 +459,13 @@ class Contract(gl.Contract):
         result_raw = gl.vm.run_nondet(leader_fn, validator_fn)
         result = _safe_parse(result_raw)
 
+        # Fail closed: if parse returns None, escalate without moving funds
         if result is None:
-            result = {"verdict": "ABORT", "payout_pct": 0, "confidence": 0, "reason": "adjudication_failed"}
+            deal.status = "ESCALATED"
+            deal.verdict = "ABORT"
+            deal.reason = "adjudication_failed: malformed output"
+            self.deals[deal_id] = deal
+            return
 
         verdict = result["verdict"]
         payout_pct = result["payout_pct"]
