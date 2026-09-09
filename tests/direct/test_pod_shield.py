@@ -135,8 +135,7 @@ def test_adjudicate_approved(direct_vm, direct_deploy, direct_alice, direct_bob,
     )
     
     direct_vm.sender = direct_bob
-    contract.commit_episode(deal_id, episode_url)
-    contract.adjudicate_deal(deal_id)
+    contract.submit_episode_and_adjudicate(deal_id, episode_url)
     
     deal_info = json.loads(contract.get_deal(deal_id))
     assert deal_info["status"] == "SETTLED"
@@ -176,8 +175,7 @@ def test_adjudicate_partial(direct_vm, direct_deploy, direct_alice, direct_bob, 
     )
     
     direct_vm.sender = direct_bob
-    contract.commit_episode(deal_id, episode_url)
-    contract.adjudicate_deal(deal_id)
+    contract.submit_episode_and_adjudicate(deal_id, episode_url)
     
     deal_info = json.loads(contract.get_deal(deal_id))
     assert deal_info["status"] == "SETTLED"
@@ -186,6 +184,8 @@ def test_adjudicate_partial(direct_vm, direct_deploy, direct_alice, direct_bob, 
 
 
 def test_adjudicate_rejected(direct_vm, direct_deploy, direct_alice, direct_bob, direct_charlie):
+    # Deploy contract with Alice as deployer/platform arbiter
+    direct_vm.sender = direct_alice
     contract = direct_deploy("contracts/pod_shield.py", to_hex(direct_charlie))
     
     # Create and stake
@@ -217,13 +217,20 @@ def test_adjudicate_rejected(direct_vm, direct_deploy, direct_alice, direct_bob,
     )
     
     direct_vm.sender = direct_bob
-    contract.commit_episode(deal_id, episode_url)
-    contract.adjudicate_deal(deal_id)
+    contract.submit_episode_and_adjudicate(deal_id, episode_url)
     
     deal_info = json.loads(contract.get_deal(deal_id))
-    assert deal_info["status"] == "SETTLED"
+    # Safe challenge step: REJECTED verdict transitions to CHALLENGED without instant slashing!
+    assert deal_info["status"] == "CHALLENGED"
     assert deal_info["verdict"] == "REJECTED"
     assert deal_info["payout_pct"] == "0"
+    
+    # Arbiter reviews and confirms the slashing
+    direct_vm.sender = direct_alice
+    contract.resolve_escalated_deal(deal_id, 0)
+    deal_info = json.loads(contract.get_deal(deal_id))
+    assert deal_info["status"] == "SETTLED"
+    assert deal_info["verdict"] == "SLASHED_BY_ARBITER"
 
 
 def test_adjudicate_escalated_and_resolved(direct_vm, direct_deploy, direct_alice, direct_bob, direct_charlie):
@@ -260,8 +267,7 @@ def test_adjudicate_escalated_and_resolved(direct_vm, direct_deploy, direct_alic
     )
     
     direct_vm.sender = direct_bob
-    contract.commit_episode(deal_id, episode_url)
-    contract.adjudicate_deal(deal_id)
+    contract.submit_episode_and_adjudicate(deal_id, episode_url)
     
     deal_info = json.loads(contract.get_deal(deal_id))
     assert deal_info["status"] == "ESCALATED"
@@ -309,8 +315,7 @@ def test_validator_confidence_threshold_mismatch(direct_vm, direct_deploy, direc
     )
     
     direct_vm.sender = direct_bob
-    contract.commit_episode(deal_id, episode_url)
-    contract.adjudicate_deal(deal_id)
+    contract.submit_episode_and_adjudicate(deal_id, episode_url)
     
     # 2. Swap mocks so the validator runs and sees: verdict="APPROVED", payout_pct=100, confidence=50 (below 65)
     # This simulates a validator node assessing low confidence.
@@ -343,7 +348,7 @@ def test_validator_confidence_threshold_mismatch(direct_vm, direct_deploy, direc
     assert validation_passed is True
 
 
-def test_commit_episode_invalid_url_prefix(direct_vm, direct_deploy, direct_alice, direct_bob, direct_charlie):
+def test_adjudicate_invalid_url_prefix(direct_vm, direct_deploy, direct_alice, direct_bob, direct_charlie):
     contract = direct_deploy("contracts/pod_shield.py", to_hex(direct_charlie))
     
     # Alice creates a deal with channel base URL: https://example.com/
@@ -363,18 +368,19 @@ def test_commit_episode_invalid_url_prefix(direct_vm, direct_deploy, direct_alic
     contract.accept_and_stake(deal_id)
     direct_vm.value = 0
     
-    # Try to commit episode URL that does not match prefix (e.g. hacky-site.com)
+    # Try to submit episode URL that does not match prefix (e.g. hacky-site.com)
     episode_url = "https://hacky-site.com/episode1"
     
     # Should revert with UserError because of prefix mismatch
     with direct_vm.expect_revert("Submitted episode URL must belong to the registered creator channel base"):
         direct_vm.sender = direct_bob
-        contract.commit_episode(deal_id, episode_url)
+        contract.submit_episode_and_adjudicate(deal_id, episode_url)
 
 
-def test_commit_episode_unauthorized_by_brand(direct_vm, direct_deploy, direct_alice, direct_bob, direct_charlie):
+def test_brand_cannot_commit_unrelated_episode(direct_vm, direct_deploy, direct_alice, direct_bob, direct_charlie):
     contract = direct_deploy("contracts/pod_shield.py", to_hex(direct_charlie))
     
+    # Alice (brand) creates deal
     direct_vm.sender = direct_alice
     direct_vm.value = 1000
     deal_id = contract.create_deal(
@@ -385,20 +391,26 @@ def test_commit_episode_unauthorized_by_brand(direct_vm, direct_deploy, direct_a
     )
     direct_vm.value = 0
     
+    # Bob (creator) stakes
     direct_vm.sender = direct_bob
     direct_vm.value = 500
     contract.accept_and_stake(deal_id)
     direct_vm.value = 0
     
-    # Brand tries to commit episode URL (unauthorized - only creator can commit)
+    # Brand tries to commit an unrelated page to force bond slashing -> MUST REVERT!
     with direct_vm.expect_revert("Only the designated creator can commit the episode URL"):
         direct_vm.sender = direct_alice
-        contract.commit_episode(deal_id, "https://example.com/episode1")
+        contract.commit_episode(deal_id, "https://example.com/old_unrelated_video")
+        
+    with direct_vm.expect_revert("Only the designated creator can commit the episode URL"):
+        direct_vm.sender = direct_alice
+        contract.submit_episode_and_adjudicate(deal_id, "https://example.com/old_unrelated_video")
 
 
-def test_approve_delivery_by_brand(direct_vm, direct_deploy, direct_alice, direct_bob, direct_charlie):
+def test_exact_commitment_and_parameterless_adjudication(direct_vm, direct_deploy, direct_alice, direct_bob, direct_charlie):
     contract = direct_deploy("contracts/pod_shield.py", to_hex(direct_charlie))
     
+    # Alice creates deal
     direct_vm.sender = direct_alice
     direct_vm.value = 1000
     deal_id = contract.create_deal(
@@ -409,90 +421,37 @@ def test_approve_delivery_by_brand(direct_vm, direct_deploy, direct_alice, direc
     )
     direct_vm.value = 0
     
+    # Bob stakes
     direct_vm.sender = direct_bob
     direct_vm.value = 500
     contract.accept_and_stake(deal_id)
     direct_vm.value = 0
     
-    # Creator commits episode
+    # Bob commits the exact episode URL
+    episode_url = "https://example.com/episode_exact"
     direct_vm.sender = direct_bob
-    contract.commit_episode(deal_id, "https://example.com/episode1")
+    contract.commit_episode(deal_id, episode_url)
     
     deal_info = json.loads(contract.get_deal(deal_id))
     assert deal_info["status"] == "COMMITTED"
+    assert deal_info["episode_url"] == episode_url
     
-    # Brand directly approves delivery without invoking AI consensus
-    direct_vm.sender = direct_alice
-    contract.approve_delivery(deal_id)
-    
-    deal_info = json.loads(contract.get_deal(deal_id))
-    assert deal_info["status"] == "SETTLED"
-    assert deal_info["verdict"] == "APPROVED_BY_BRAND"
-    assert deal_info["payout_pct"] == "100"
-
-
-def test_challenge_delivery_by_brand(direct_vm, direct_deploy, direct_alice, direct_bob, direct_charlie):
-    contract = direct_deploy("contracts/pod_shield.py", to_hex(direct_charlie))
-    
-    direct_vm.sender = direct_alice
-    direct_vm.value = 1000
-    deal_id = contract.create_deal(
-        to_hex(direct_bob),
-        "https://example.com/",
-        "This is the sponsor script that is longer than fifteen characters",
-        "PROMO123"
-    )
-    direct_vm.value = 0
-    
-    direct_vm.sender = direct_bob
-    direct_vm.value = 500
-    contract.accept_and_stake(deal_id)
-    direct_vm.value = 0
-    
-    # Creator commits episode
-    direct_vm.sender = direct_bob
-    contract.commit_episode(deal_id, "https://example.com/episode1")
-    
-    # Setup mocks for AI audit
+    # Setup mocks for AI consensus
     body_content = "This transcript contains sponsor script that is longer than fifteen characters and the promo code PROMO123"
     _setup_adjudicate_mocks(
         direct_vm,
-        "example.com/episode1",
+        "example.com/episode_exact",
         body_content,
         "APPROVED",
         100,
         90
     )
     
-    # Brand challenges delivery, invoking AI adjudication
+    # Brand triggers adjudication without passing any arbitrary URL parameter!
     direct_vm.sender = direct_alice
-    contract.challenge_delivery(deal_id)
+    contract.adjudicate_deal(deal_id)
     
     deal_info = json.loads(contract.get_deal(deal_id))
     assert deal_info["status"] == "SETTLED"
     assert deal_info["verdict"] == "APPROVED"
     assert deal_info["payout_pct"] == "100"
-
-
-def test_adjudicate_uncommitted_deal(direct_vm, direct_deploy, direct_alice, direct_bob, direct_charlie):
-    contract = direct_deploy("contracts/pod_shield.py", to_hex(direct_charlie))
-    
-    direct_vm.sender = direct_alice
-    direct_vm.value = 1000
-    deal_id = contract.create_deal(
-        to_hex(direct_bob),
-        "https://example.com/",
-        "This is the sponsor script that is longer than fifteen characters",
-        "PROMO123"
-    )
-    direct_vm.value = 0
-    
-    direct_vm.sender = direct_bob
-    direct_vm.value = 500
-    contract.accept_and_stake(deal_id)
-    direct_vm.value = 0
-    
-    # Trying to adjudicate before creator commits episode must revert
-    with direct_vm.expect_revert("Deal is not ready for adjudication (creator must commit episode first)"):
-        direct_vm.sender = direct_bob
-        contract.adjudicate_deal(deal_id)
